@@ -2,3 +2,9 @@ hello
 world
 password
 123456
+letmein
+dragon
+monkey
+qwerty
+master
+admin

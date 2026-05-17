@@ -1,6 +1,17 @@
 #include <stdio.h> // for file I/O and printf
 #include <string.h> // for strlen, strcmp, and strcspn
 #include <openssl/evp.h> // for EVP digest functions
+# include <pthread.h> // for multithreading 
+
+// shared state passed to every thread
+typedef struct {
+    FILE *wordlist;            // shared file handle
+    char target_hash[129];     // hash we're trying to crack
+    const EVP_MD *md;          // which algorithm
+    volatile int found;        // stop flag - 1 means someone cracked it
+    pthread_mutex_t mutex;     // protects file reading and output
+    long attempts;             // total attempts across all threads
+} CrackJob;
 
 void bytes_to_hex(unsigned char *bytes, int len, char *out) { //converts byte array to hex string
     for (int i = 0; i < len; i++) { 
@@ -24,49 +35,82 @@ int crack(const char *word, const char *target_hash, const EVP_MD *md) { //funct
     return strcmp(hex, target_hash) == 0; // compare the computed hash with the target hash and return 1 if they match, 0 otherwise
 }
 
+void *worker(void *arg) { // thread function to read lines from the wordlist and check against the target hash
+    CrackJob *job = (CrackJob *)arg;  // cast the void pointer back to CrackJob
+    char line[256];
 
-int main(int argc, char *argv[]) { //main function to read the wordlist and check each word against the target hash
-    if (argc != 4) { // check if the correct number of arguments is provided
-        printf("Usage: %s <wordlist> <hash> <algo>\n", argv[0]); // print usage message if arguments are missing
-        printf("Supported algorithms: md5, sha1, sha256, sha512\n"); // print supported algorithms
-        return 1;
-    }
+    while (1) {
+    // check stop flag before doing any work
+    pthread_mutex_lock(&job->mutex);
+    if (job->found) { pthread_mutex_unlock(&job->mutex); break; }  // bail early
+    int got_line = (fgets(line, sizeof(line), job->wordlist) != NULL);
+    job->attempts++;
+    pthread_mutex_unlock(&job->mutex);
 
-    char *wordlist_path = argv[1]; // path to the wordlist file
-    char *target_hash   = argv[2]; // target MD5 hash to crack
-    char *algo          = argv[3]; // hashing algorithm to use implemented in the md5_crack function (currently only MD5, but we set up for future extension)
+    if (!got_line) break;
 
-    const EVP_MD *md = NULL; // pointer to the selected hashing algorithm
-    if      (strcmp(algo, "md5")    == 0) md = EVP_md5();  // select the appropriate hashing algorithm based on user input
-    else if (strcmp(algo, "sha1")   == 0) md = EVP_sha1(); // SHA1 is not implemented in the md5_crack function, but we set it here for future extension
-    else if (strcmp(algo, "sha256") == 0) md = EVP_sha256(); // SHA256 is not implemented in the md5_crack function, but we set it here for future extension
-    else if (strcmp(algo, "sha512") == 0) md = EVP_sha512(); // SHA512 is not implemented in the md5_crack function, but we set it here for future extension
-    else {
-        printf("Unknown algorithm: %s\n", algo);
-        return 1;
-    }
+    line[strcspn(line, "\r\n")] = '\0';
 
-    FILE *f = fopen(wordlist_path, "r"); // open the wordlist file for reading
-    if (!f) {
-        perror("Failed to open wordlist"); // print error message if file cannot be opened
-        return 1;
-    }
-
-    char line[256]; // buffer to hold each line from the wordlist
-    long attempts = 0;
-
-    while (fgets(line, sizeof(line), f)) { // read each line from the wordlist
-        line[strcspn(line, "\r\n")] = '\0';  // strip newline
-        attempts++;
-
-        if (crack(line, target_hash, md)) { // check if the current line's hash matches the target hash
-            printf("[+] CRACKED after %ld attempts: %s\n", attempts, line);
-            fclose(f);
-            return 0;
+    if (crack(line, job->target_hash, job->md)) {
+        pthread_mutex_lock(&job->mutex);
+        if (!job->found) {
+            printf("[+] CRACKED after %ld attempts: %s\n", job->attempts, line);
+            job->found = 1;
         }
+        pthread_mutex_unlock(&job->mutex);
+        break;
+    }
+ }
+    return NULL;
+}
+
+
+int main(int argc, char *argv[]) {
+    if (argc != 5) {
+        printf("Usage: %s <wordlist> <hash> <algo> <threads>\n", argv[0]);
+        return 1;
     }
 
-    printf("[-] Not found after %ld attempts\n", attempts); // print message if the target hash was not found in the wordlist
+    char *wordlist_path = argv[1];
+    char *target_hash   = argv[2];
+    char *algo          = argv[3];
+    int   num_threads   = atoi(argv[4]);  // atoi converts string to int
+
+    const EVP_MD *md = NULL;
+    if      (strcmp(algo, "md5")    == 0) md = EVP_md5();
+    else if (strcmp(algo, "sha1")   == 0) md = EVP_sha1();
+    else if (strcmp(algo, "sha256") == 0) md = EVP_sha256();
+    else if (strcmp(algo, "sha512") == 0) md = EVP_sha512();
+    else { printf("Unknown algorithm: %s\n", algo); return 1; }
+
+    FILE *f = fopen(wordlist_path, "r");
+    if (!f) { perror("Failed to open wordlist"); return 1; }
+
+    // set up the shared job
+    CrackJob job;
+    job.wordlist = f;
+    strncpy(job.target_hash, target_hash, sizeof(job.target_hash));
+    job.md       = md;
+    job.found    = 0;
+    job.attempts = 0;
+    pthread_mutex_init(&job.mutex, NULL);  // initialise the mutex
+
+    // spawn threads
+    pthread_t threads[num_threads];
+    for (int i = 0; i < num_threads; i++) {
+        pthread_create(&threads[i], NULL, worker, &job);
+    }
+
+    // wait for all threads to finish
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    if (!job.found) {
+        printf("[-] Not found after %ld attempts\n", job.attempts);
+    }
+
+    pthread_mutex_destroy(&job.mutex);  // clean up mutex
     fclose(f);
-    return 1;
+    return 0;
 }
