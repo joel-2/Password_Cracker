@@ -2,6 +2,7 @@
 #include <string.h> // for strlen, strcmp, and strcspn
 #include <openssl/evp.h> // for EVP digest functions
 # include <pthread.h> // for multithreading 
+#include "rules.h" // for rule function declarations
 
 // shared state passed to every thread
 typedef struct {
@@ -11,6 +12,7 @@ typedef struct {
     volatile int found;        // stop flag - 1 means someone cracked it
     pthread_mutex_t mutex;     // protects file reading and output
     long attempts;             // total attempts across all threads
+    int use_rules;            // whether to apply rules or not
 } CrackJob;
 
 void bytes_to_hex(unsigned char *bytes, int len, char *out) { //converts byte array to hex string
@@ -40,34 +42,57 @@ void *worker(void *arg) { // thread function to read lines from the wordlist and
     char line[256];
 
     while (1) {
-    // check stop flag before doing any work
-    pthread_mutex_lock(&job->mutex);
-    if (job->found) { pthread_mutex_unlock(&job->mutex); break; }  // bail early
-    int got_line = (fgets(line, sizeof(line), job->wordlist) != NULL);
-    job->attempts++;
-    pthread_mutex_unlock(&job->mutex);
-
-    if (!got_line) break;
-
-    line[strcspn(line, "\r\n")] = '\0';
-
-    if (crack(line, job->target_hash, job->md)) {
+        // check stop flag before doing any work
         pthread_mutex_lock(&job->mutex);
-        if (!job->found) {
-            printf("[+] CRACKED after %ld attempts: %s\n", job->attempts, line);
-            job->found = 1;
-        }
+        if (job->found) { pthread_mutex_unlock(&job->mutex); break; }  // bail early
+        int got_line = (fgets(line, sizeof(line), job->wordlist) != NULL);
+        job->attempts++;
         pthread_mutex_unlock(&job->mutex);
+
+        if (!got_line) break;
+
+        line[strcspn(line, "\r\n")] = '\0';
+        printf("[debug] word: '%s' use_rules: %d\n", line, job->use_rules);
+
+        // try the word as-is
+        if (crack(line, job->target_hash, job->md)) {
+            pthread_mutex_lock(&job->mutex);
+            if (!job->found) {
+                printf("[+] CRACKED after %ld attempts: %s\n", job->attempts, line);
+                job->found = 1;
+            }
+            pthread_mutex_unlock(&job->mutex);
+            break;
+        }
+
+        // try every rule mutation if --rules flag is set
+        if (job->use_rules) {
+            char mutated[256];
+            for (int i = 0; i < rule_count; i++) {
+                rules[i](line, mutated);                          // apply rule to get mutated word
+                printf("[debug] rule %d: '%s' -> '%s'\n", i, line, mutated);
+                if (crack(mutated, job->target_hash, job->md)) {
+                    pthread_mutex_lock(&job->mutex);
+                    if (!job->found) {
+                        printf("[+] CRACKED after %ld attempts: %s (rule: %d)\n", job->attempts, mutated, i);
+                        job->found = 1;
+                    }
+                    pthread_mutex_unlock(&job->mutex);
+                    goto done;  // break out of both the for loop and while loop
+                }
+            }
+        }
+        continue;
+        done:
         break;
     }
- }
     return NULL;
 }
 
 
 int main(int argc, char *argv[]) {
-    if (argc != 5) {
-        printf("Usage: %s <wordlist> <hash> <algo> <threads>\n", argv[0]);
+    if (argc < 5) {
+        printf("Usage: %s <wordlist> <hash> <algo> <threads> [--rules]\n", argv[0]);
         return 1;
     }
 
@@ -93,6 +118,12 @@ int main(int argc, char *argv[]) {
     job.md       = md;
     job.found    = 0;
     job.attempts = 0;
+    // check if --rules flag was passed
+    job.use_rules = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--rules") == 0) job.use_rules = 1;
+    }
+
     pthread_mutex_init(&job.mutex, NULL);  // initialise the mutex
 
     // spawn threads
