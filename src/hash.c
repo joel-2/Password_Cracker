@@ -52,7 +52,7 @@ void *worker(void *arg) { // thread function to read lines from the wordlist and
         if (!got_line) break;
 
         line[strcspn(line, "\r\n")] = '\0';
-        printf("[debug] word: '%s' use_rules: %d\n", line, job->use_rules);
+       
 
         // try the word as-is
         if (crack(line, job->target_hash, job->md)) {
@@ -70,7 +70,7 @@ void *worker(void *arg) { // thread function to read lines from the wordlist and
             char mutated[256];
             for (int i = 0; i < rule_count; i++) {
                 rules[i](line, mutated);                          // apply rule to get mutated word
-                printf("[debug] rule %d: '%s' -> '%s'\n", i, line, mutated);
+                
                 if (crack(mutated, job->target_hash, job->md)) {
                     pthread_mutex_lock(&job->mutex);
                     if (!job->found) {
